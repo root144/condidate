@@ -3,21 +3,23 @@ import sqlite3
 import re
 import os
 import shutil
-from dashboard_widget import DashboardWidget
-import subprocess
+import hashlib
 from datetime import datetime
+
 import pandas as pd
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QFormLayout, QLineEdit, QComboBox, QTextEdit, QTableWidget,
     QTableWidgetItem, QPushButton, QLabel, QMessageBox, QTabWidget,
-    QHeaderView, QFileDialog, QDateEdit, QFrame, QGraphicsDropShadowEffect
+    QHeaderView, QFileDialog, QDateEdit, QFrame, QDialog, QDialogButtonBox, QAction
 )
 from PyQt5.QtCore import Qt, QDate, QTimer
-from PyQt5.QtGui import QFont, QColor, QPixmap
+from PyQt5.QtGui import QPixmap
 
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
+
+from dashboard_widget import DashboardWidget
 
 DB_NAME = "candidates_modern.db"
 ATTACH_DIR = "attachments"
@@ -129,27 +131,6 @@ QToolTip {
 
 THEME_LIGHT = ""
 
-from PyQt5.QtWidgets import QStyledItemDelegate, QComboBox
-
-class ComboBoxDelegate(QStyledItemDelegate):
-    def __init__(self, items, parent=None):
-        super().__init__(parent)
-        self.items = items
-
-    def createEditor(self, parent, option, index):
-        combo = QComboBox(parent)
-        combo.addItems(self.items)
-        return combo
-
-    def setEditorData(self, editor, index):
-        value = index.data()
-        idx = editor.findText(value)
-        if idx >= 0:
-            editor.setCurrentIndex(idx)
-
-    def setModelData(self, editor, model, index):
-        model.setData(index, editor.currentText())
-
 class DatabaseManager:
     def __init__(self):
         self.init_database()
@@ -178,12 +159,39 @@ class DatabaseManager:
                     date_creation TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-            # Ajout des colonnes si besoin
             for col in ["cv_path", "attachments", "photo_path", "source"]:
                 try:
                     c.execute(f"ALTER TABLE candidates ADD COLUMN {col} TEXT")
                 except sqlite3.OperationalError:
                     pass
+
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL UNIQUE,
+                    password TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK(role IN ('admin', 'user'))
+                )
+            ''')
+            c.execute('SELECT COUNT(*) FROM users')
+            if c.fetchone()[0] == 0:
+                pw = hashlib.sha256("admin".encode()).hexdigest()
+                c.execute('INSERT INTO users (username, password, role) VALUES (?, ?, ?)', ('admin', pw, 'admin'))
+            conn.commit()
+
+    def authenticate(self, username, password):
+        pw = hashlib.sha256(password.encode()).hexdigest()
+        with self.connect() as conn:
+            c = conn.cursor()
+            c.execute("SELECT role FROM users WHERE username=? AND password=?", (username, pw))
+            result = c.fetchone()
+            return result[0] if result else None
+
+    def add_user(self, username, password, role):
+        pw = hashlib.sha256(password.encode()).hexdigest()
+        with self.connect() as conn:
+            c = conn.cursor()
+            c.execute('INSERT INTO users (username, password, role) VALUES (?, ?, ?)', (username, pw, role))
             conn.commit()
 
     def search_candidates(self, filters):
@@ -270,6 +278,57 @@ class DatabaseManager:
             c.execute("SELECT COUNT(*) FROM candidates WHERE statut='Refusé'")
             refuse = c.fetchone()[0]
         return dict(total=total, en_attente=attente, entretien=entretien, accepte=accepte, refuse=refuse)
+
+from PyQt5.QtWidgets import QStyledItemDelegate
+
+class ComboBoxDelegate(QStyledItemDelegate):
+    def __init__(self, items, parent=None):
+        super().__init__(parent)
+        self.items = items
+
+    def createEditor(self, parent, option, index):
+        combo = QComboBox(parent)
+        combo.addItems(self.items)
+        return combo
+
+    def setEditorData(self, editor, index):
+        value = index.data()
+        idx = editor.findText(value)
+        if idx >= 0:
+            editor.setCurrentIndex(idx)
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, editor.currentText())
+
+class LoginDialog(QDialog):
+    def __init__(self, db, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Connexion")
+        self.db = db
+        layout = QFormLayout(self)
+        self.username_input = QLineEdit()
+        self.password_input = QLineEdit()
+        self.password_input.setEchoMode(QLineEdit.Password)
+        layout.addRow("Nom d'utilisateur", self.username_input)
+        layout.addRow("Mot de passe", self.password_input)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        self.setLayout(layout)
+        self.role = None
+        self.username = None
+
+    def accept(self):
+        username = self.username_input.text()
+        password = self.password_input.text()
+        role = self.db.authenticate(username, password)
+        if role:
+            self.role = role
+            self.username = username
+            super().accept()
+        else:
+            QMessageBox.warning(self, "Erreur", "Identifiants invalides")
 
 class DropArea(QLabel):
     def __init__(self, parent=None):
@@ -425,9 +484,10 @@ class ModernCandidateForm(QWidget):
         self.photo_label.setText("Aucune photo")
 
 class ModernCandidatesTable(QWidget):
-    def __init__(self, db, parent=None):
+    def __init__(self, db, user_role="user", parent=None):
         super().__init__(parent)
         self.db = db
+        self.user_role = user_role
         l = QVBoxLayout(self)
         filters_layout = QHBoxLayout()
         self.filter_nom = QLineEdit()
@@ -475,7 +535,7 @@ class ModernCandidatesTable(QWidget):
             "CV", "Pièces jointes", "Date Création", "Actions"
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self.table.setColumnWidth(0, 40)  # Réduit la colonne ID à 50 pixels (tu peux ajuster la valeur)
+        self.table.setColumnWidth(0, 40)
         l.addWidget(self.table)
 
         self.statut_delegate = ComboBoxDelegate(
@@ -497,7 +557,7 @@ class ModernCandidatesTable(QWidget):
             return
         row = item.row()
         col = item.column()
-        if col in (6, 7):  # 6 = Statut, 7 = Priorité
+        if col in (6, 7):
             candidate_id = self.table.item(row, 0).text()
             new_value = item.text()
             if col == 6:
@@ -540,7 +600,7 @@ class ModernCandidatesTable(QWidget):
                 if col < 10:
                     item = QTableWidgetItem(str(cand[col]) if cand[col] is not None else "")
                     self.table.setItem(row, col, item)
-                elif col == 10:  # Photo
+                elif col == 10:
                     w = QLabel()
                     if cand[11]:
                         pix = QPixmap(cand[11])
@@ -548,14 +608,14 @@ class ModernCandidatesTable(QWidget):
                             w.setPixmap(pix.scaled(40, 40, Qt.KeepAspectRatio, Qt.SmoothTransformation))
                     w.setAlignment(Qt.AlignCenter)
                     self.table.setCellWidget(row, col, w)
-                elif col == 11:  # CV
+                elif col == 11:
                     if cand[9]:
                         btn = QPushButton("Voir CV")
                         btn.clicked.connect(lambda _, path=cand[9]: self.open_file(path))
                         self.table.setCellWidget(row, col, btn)
                     else:
                         self.table.setItem(row, col, QTableWidgetItem(""))
-                elif col == 12:  # Attachments
+                elif col == 12:
                     if cand[10]:
                         files = cand[10].split(";")
                         w = QWidget()
@@ -573,7 +633,7 @@ class ModernCandidatesTable(QWidget):
                 elif col == 13:
                     item = QTableWidgetItem(str(cand[13]) if len(cand) > 13 else "")
                     self.table.setItem(row, col, item)
-                elif col == 14:  # Actions
+                elif col == 14:
                     w = QWidget()
                     h = QHBoxLayout(w)
                     btn_delete = QPushButton("Supprimer")
@@ -581,6 +641,8 @@ class ModernCandidatesTable(QWidget):
                     btn_delete.clicked.connect(lambda _, cid=candidate_id: self.delete_candidate(cid))
                     btn_pdf = QPushButton("PDF")
                     btn_pdf.clicked.connect(lambda _, cid=candidate_id: self.export_pdf(cid))
+                    if self.user_role != "admin":
+                        btn_delete.setEnabled(False)
                     h.addWidget(btn_delete)
                     h.addWidget(btn_pdf)
                     h.setContentsMargins(0,0,0,0)
@@ -591,15 +653,18 @@ class ModernCandidatesTable(QWidget):
     def open_file(self, path):
         if os.path.exists(path):
             if sys.platform.startswith('darwin'):
-                subprocess.call(('open', path))
+                os.system(f'open "{path}"')
             elif os.name == 'nt':
                 os.startfile(path)
             elif os.name == 'posix':
-                subprocess.call(('xdg-open', path))
+                os.system(f'xdg-open "{path}"')
         else:
             QMessageBox.warning(self, "Fichier introuvable", "Le fichier n'existe plus à cet emplacement.")
 
     def delete_candidate(self, candidate_id):
+        if self.user_role != "admin":
+            QMessageBox.warning(self, "Droits insuffisants", "Seul un admin peut supprimer un candidat.")
+            return
         reply = QMessageBox.question(self, "Suppression", "Supprimer ce candidat ?", QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
             self.db.delete_candidate(candidate_id)
@@ -691,16 +756,17 @@ class ModernCandidatesTable(QWidget):
         except Exception as e:
             QMessageBox.warning(self, "Erreur", f"Erreur import : {e}")
 
-
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, user_role="user", username='', db=None):
         super().__init__()
+        self.user_role = user_role
+        self.username = username
+        self.db = db if db else DatabaseManager()
         self.setWindowTitle("Gestionnaire de Candidatures Moderne")
         self.setGeometry(100, 100, 1450, 800)
-        self.db = DatabaseManager()
         self.tab = QTabWidget()
         self.dashboard = DashboardWidget(self.db)
-        self.candidates_table = ModernCandidatesTable(self.db)
+        self.candidates_table = ModernCandidatesTable(self.db, user_role=self.user_role)
         self.candidate_form = ModernCandidateForm(self.db, self.dashboard, self.candidates_table)
         self.tab.addTab(self.dashboard, "Dashboard")
         self.tab.addTab(self.candidate_form, "Ajouter Candidat")
@@ -712,17 +778,29 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.update_status)
         self.timer.start(10000)
 
-        # Mode sombre/clair
         self.dark_mode = False
         self.mode_btn = QPushButton("Mode sombre")
         self.mode_btn.clicked.connect(self.toggle_theme)
         self.status.addPermanentWidget(self.mode_btn)
 
+        # Menu Mon compte
+        self.menu_account = self.menuBar().addMenu("Mon compte")
+        self.action_change_password = QAction("Changer mon mot de passe", self)
+        self.action_change_password.triggered.connect(self.show_change_password_dialog)
+        self.menu_account.addAction(self.action_change_password)
+
+        # Menu admin
+        if self.user_role == "admin":
+            self.menu_admin = self.menuBar().addMenu("Admin")
+            self.action_add_user = QAction("Ajouter utilisateur", self)
+            self.action_add_user.triggered.connect(self.show_add_user_dialog)
+            self.menu_admin.addAction(self.action_add_user)
+
     def update_status(self):
         stats = self.db.get_stats()
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.status.showMessage(
-            f"Candidats: {stats['total']} | Acceptés: {stats['accepte']} | En attente: {stats['en_attente']} | {now}"
+            f"Connecté: {self.username} | Rôle: {self.user_role} | Candidats: {stats['total']} | Acceptés: {stats['accepte']} | En attente: {stats['en_attente']} | {now}"
         )
 
     def toggle_theme(self):
@@ -735,11 +813,94 @@ class MainWindow(QMainWindow):
             app.setStyleSheet(THEME_LIGHT)
             self.mode_btn.setText("Mode sombre")
 
+    def show_add_user_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Ajout d’un utilisateur")
+        layout = QFormLayout(dialog)
+        username_input = QLineEdit()
+        password_input = QLineEdit()
+        password_input.setEchoMode(QLineEdit.Password)
+        role_input = QComboBox()
+        role_input.addItems(["user", "admin"])
+        layout.addRow("Nom d'utilisateur", username_input)
+        layout.addRow("Mot de passe", password_input)
+        layout.addRow("Rôle", role_input)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+
+        def add_user():
+            username = username_input.text()
+            password = password_input.text()
+            role = role_input.currentText()
+            if not username or not password:
+                QMessageBox.warning(dialog, "Erreur", "Tous les champs sont obligatoires.")
+                return
+            try:
+                self.db.add_user(username, password, role)
+                QMessageBox.information(dialog, "Succès", "Utilisateur créé.")
+                dialog.accept()
+            except Exception as e:
+                QMessageBox.warning(dialog, "Erreur", str(e))
+
+        buttons.accepted.connect(add_user)
+        buttons.rejected.connect(dialog.reject)
+        dialog.exec_()
+
+    def show_change_password_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Changer mon mot de passe")
+        layout = QFormLayout(dialog)
+        old_pw_input = QLineEdit()
+        old_pw_input.setEchoMode(QLineEdit.Password)
+        new_pw_input = QLineEdit()
+        new_pw_input.setEchoMode(QLineEdit.Password)
+        conf_pw_input = QLineEdit()
+        conf_pw_input.setEchoMode(QLineEdit.Password)
+        layout.addRow("Ancien mot de passe", old_pw_input)
+        layout.addRow("Nouveau mot de passe", new_pw_input)
+        layout.addRow("Confirmation", conf_pw_input)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+
+        def change_pw():
+            old_pw = old_pw_input.text()
+            new_pw = new_pw_input.text()
+            conf_pw = conf_pw_input.text()
+            if not old_pw or not new_pw or not conf_pw:
+                QMessageBox.warning(dialog, "Erreur", "Tous les champs sont obligatoires.")
+                return
+            if new_pw != conf_pw:
+                QMessageBox.warning(dialog, "Erreur", "La confirmation ne correspond pas.")
+                return
+            # Vérifier l'ancien mot de passe
+            pw_hash = hashlib.sha256(old_pw.encode()).hexdigest()
+            with self.db.connect() as conn:
+                c = conn.cursor()
+                c.execute("SELECT id FROM users WHERE username=? AND password=?", (self.username, pw_hash))
+                row = c.fetchone()
+                if not row:
+                    QMessageBox.warning(dialog, "Erreur", "L'ancien mot de passe est incorrect.")
+                    return
+                # Mettre à jour le mot de passe
+                new_pw_hash = hashlib.sha256(new_pw.encode()).hexdigest()
+                c.execute("UPDATE users SET password=? WHERE username=?", (new_pw_hash, self.username))
+                conn.commit()
+                QMessageBox.information(dialog, "Succès", "Mot de passe modifié avec succès.")
+                dialog.accept()
+        buttons.accepted.connect(change_pw)
+        buttons.rejected.connect(dialog.reject)
+        dialog.exec_()
+
 def main():
     app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec_())
+    db = DatabaseManager()
+    login = LoginDialog(db)
+    if login.exec_() == QDialog.Accepted:
+        window = MainWindow(user_role=login.role, username=login.username, db=db)
+        window.show()
+        sys.exit(app.exec_())
+    else:
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()
